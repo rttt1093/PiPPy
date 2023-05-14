@@ -4,7 +4,6 @@ import socket
 import logging
 from typing import List
 
-
 # Pinning process to a separate GPU if not yet done by launch script
 # Notes:
 # 1. Previously this env was added to work around an issue that each RPC process creates an extra CUDA context on device
@@ -17,8 +16,8 @@ from typing import List
 if os.getenv("PIPPY_PIN_DEVICE", "0") == "1":
     cuda_devices_str = os.getenv("CUDA_VISIBLE_DEVICES")
     if (
-        cuda_devices_str is None  # not set
-        or len(cuda_devices_str.split(",")) > 1
+            cuda_devices_str is None  # not set
+            or len(cuda_devices_str.split(",")) > 1
     ):  # or set to all devices
         # If launchers like Torchrun sets `LOCAL_RANK`, we would use this information
         local_rank_str = os.getenv("LOCAL_RANK")
@@ -30,9 +29,8 @@ if os.getenv("PIPPY_PIN_DEVICE", "0") == "1":
 
 
 import torch
-import torch.multiprocessing as mp
 import torch.distributed.rpc as rpc
-
+import functools
 
 PIPPY_VERBOSITY = os.environ.get("PIPPY_VERBOSITY", "OFF")
 
@@ -93,12 +91,12 @@ def has_efa() -> bool:
         import subprocess
 
         return (
-            subprocess.run(
-                ["fi_info", "-p", "efa", "-t", "FI_EP_RDM"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            ).returncode
-            == 0
+                subprocess.run(
+                    ["fi_info", "-p", "efa", "-t", "FI_EP_RDM"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                ).returncode
+                == 0
         )
     except FileNotFoundError:
         return False
@@ -111,6 +109,8 @@ def tp_transports():
 
 
 global _pp_group_barrier
+
+
 # Defined later in `run_worker` (triggered via `run_pippy`)
 
 
@@ -152,17 +152,60 @@ def run_pippy(run_func, args, *extra_args):
         f"PP group size: {args.pp_group_size}"
     )
 
-    if args.rank == -1:
-        mp.spawn(
-            run_worker,
-            args=(run_func, args, *extra_args),
-            nprocs=actual_world_size,
-            join=True,
-        )
-    elif args.rank < actual_world_size:
-        run_worker(args.rank, run_func, args, *extra_args)
-    else:
-        print("I'm unused, exiting")
+    # patch ForkingPickler
+    import pippy.pippy_forking_pickler
+    from multiprocessing import reduction, connection, queues
+    reduction.ForkingPickler = pippy.pippy_forking_pickler.PiPPyForkingPickler
+    connection._ForkingPickler = pippy.pippy_forking_pickler.PiPPyForkingPickler
+    queues._ForkingPickler = pippy.pippy_forking_pickler.PiPPyForkingPickler
+
+    # TODO: code of keeping the original code
+    # import torch.multiprocessing as mp
+    # ctx = mp.get_context("forkserver")
+    # args.model.share_memory()
+    #
+    # if args.rank == -1:
+    #     with ctx.Pool(actual_world_size) as pool:
+    #         run_worker_with_args = functools.partial(run_worker, args.rank, run_func, args, *extra_args)
+    #         pool.map(run_worker_with_args, range(actual_world_size))
+    # elif args.rank < actual_world_size:
+    #     run_worker(args.rank, run_func, args, *extra_args)
+    # else:
+    #     print("I'm unused, exiting")
+
+    from dask.utils import SerializableLock
+    import torch.multiprocessing as mp
+    from torch.multiprocessing import Process, Lock
+
+    ctx = mp.get_context("forkserver")
+    args.model.share_memory()
+    #lock = ctx.Lock()
+    #lock = Lock()
+    lock = SerializableLock()
+    processes = []
+
+    for rank in range(actual_world_size):
+        #if rank == 0:
+        #    # Start the first process using the context's pool
+        #    with ctx.Pool(processes=actual_world_size) as pool:
+        #        run_worker_with_args = functools.partial(worker, rank, lock, run_func, args, extra_args)
+        #        pool.map(run_worker_with_args, range(actual_world_size))
+        #else:
+        # Start the other processes using Process
+        p = Process(target=worker, args=(rank, lock, run_func, args, extra_args))
+        p.start()
+        processes.append(p)
+
+    for p in processes:
+        p.join()
+
+
+def worker(rank, lock, run_func, args, extra_args):
+    lock.acquire()
+    try:
+        run_worker(rank, run_func, args, *extra_args)
+    finally:
+        lock.release()
 
 
 def run_worker(rank, run_func, args, *extra_args):
